@@ -1,0 +1,74 @@
+name: Deploy Portfolio and Publish Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Portfolio
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # AWS LOGIN
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-2
+
+      # DEPLOY WEBSITE TO S3
+      - name: Deploy site to S3
+        run: |
+          aws s3 sync ./site s3://${{ secrets.S3_BUCKET_NAME }} --delete
+
+      # CLEAR CLOUDFRONT CACHE
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+  linkedin-release:
+    name: Publish LinkedIn Release
+    needs:
+      - deploy
+
+    if: >
+      success() &&
+      startsWith(github.event.head_commit.message, 'release:')
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Publish LinkedIn post
+        env:
+          LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+          LINKEDIN_PERSON_URN: ${{ secrets.LINKEDIN_PERSON_URN }}
+          RELEASE_MESSAGE: ${{ github.event.head_commit.message }}
+          PORTFOLIO_URL: https://benjaminc.cloud
+          GITHUB_URL: https://github.com/BenjaminCooper-WAF
+
+        run: |
+          python scripts/linkedin-post.py

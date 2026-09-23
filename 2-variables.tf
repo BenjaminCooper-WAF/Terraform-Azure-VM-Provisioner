@@ -1,6 +1,6 @@
 variable "location" {
   type    = string
-  default = "UK South"
+  default = "var.location"
 }
 
 variable "admin_username" {
@@ -13,6 +13,11 @@ variable "ssh_public_key" {
   type        = string
   sensitive   = true
 
-  default     = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO1+P0L5PbZj0YdKPhLt9mPuejNJtYDAQE6UMwhNl6XZ Specu@Benjamin"
+  # Never hardcode your SSH public key in production. Use a secure method to provide it, such as environment variables or secret management tools.
+  default = "ssh-ed25519 Xxxxxx/xxx"
+}
 
+variable "my_ip" {
+  description = "My public IP for SSH access"
+  type        = string
 }

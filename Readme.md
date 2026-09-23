@@ -6,178 +6,181 @@
 ![Azure CLI](https://img.shields.io/badge/AZURE_CLI-AUTH-0078D4?style=for-the-badge&logo=powershell&logoColor=white)
 ![SSH](https://img.shields.io/badge/SSH-KEY_AUTH-000000?style=for-the-badge&logo=openssh&logoColor=white)
 ![Networking](https://img.shields.io/badge/VNET-SUBNET_%2B_NSG-50E6FF?style=for-the-badge&logo=cisco&logoColor=white)
+![Remote State](https://img.shields.io/badge/STATE-AZURE_BLOB-0062AD?style=for-the-badge&logo=microsoftazure&logoColor=white)
 
-# Mission Objective
-* A Terraform project that provisions two Ubuntu 24.04 LTS Linux virtual machines (`vm01`, `vm02`) on Azure, each with its own public IP and NIC, sitting inside a dedicated virtual network / subnet that is protected by a network security group allowing inbound SSH.
+## At a Glance
 
-# Checkpoints
+I used Terraform to build a small, secure Linux environment on Microsoft Azure entirely from code: two Ubuntu servers, their network, and a firewall. Nothing was clicked together in the portal. One command builds it, one command tears it down.
 
-1. [Prerequisites](#prerequisites)
-2. [Step-1 (Azure Authentication)](#step-1-azure-authentication)
-3. [Step-2 (Provider Configuration)](#step-2-provider-configuration)
-4. [Step-3 (Networking Resources)](#step-3-networking-resources)
-5. [Step-4 (Compute Resources)](#step-4-compute-resources)
-6. [Step-5 (Terraform Init)](#step-5-terraform-init)
-7. [Step-6 (Terraform Plan)](#step-6-terraform-plan)
-8. [Step-7 (Terraform Apply)](#step-7-terraform-apply)
-9. [Step-8 (Verification)](#step-8-verification)
-10. [Errors](#errors)
-11. [Deliverables](#deliverables)
-12. [Final Step - Teardown](#final-step---teardown)
-13. [Author](#author)
+**What it delivers:**
 
-# Prerequisites
-* Terraform installed (version 1.8.0 or higher)
-* Azure CLI installed and authenticated (`az login`)
-* An active Azure subscription
-* An SSH key pair for VM admin access
-* Basic understanding of Azure networking concepts
-* Patience & lots of coffee
+* Two identical Ubuntu 24.04 servers, created from a single definition
+* A private network with a firewall that only lets **my own IP address** log in
+* Password-free login using SSH keys
+* Terraform state stored securely in Azure Storage instead of on my laptop
+* The whole environment can be rebuilt or deleted in minutes, which keeps costs under control
 
-# Step-1 (Azure Authentication)
+## Skills Demonstrated
 
-Before Terraform can talk to Azure, the CLI needs to be logged in and pointed at the right subscription.
+* **Infrastructure as Code** - Terraform, `for_each` loops, variables, outputs, remote state
+* **Azure** - Virtual Machines, Virtual Networks, Network Security Groups, Public IPs, Storage
+* **Security** - SSH key authentication, IP-restricted firewall rules, keeping secrets out of source control
+* **Troubleshooting** - reading provider errors, fixing region capacity and subscription issues (see [Challenges & Fixes](#challenges--fixes))
+* **Cost awareness** - right-sized VMs and full teardown when finished
 
-* `az login`
-* `az account show`
+## Architecture
 
-See screenshot below
+![Architecture diagram](Images/azure-two-vm-poster-dark.png "Two Ubuntu VMs on Azure deployed with Terraform for_each")
+
+## Project Structure
+
+| File | Purpose |
+| --- | --- |
+| `0-providers.tf` | Terraform `>= 1.8.0` and the `azurerm ~> 5.0` provider |
+| `1-subnets.tf` | `subnet-vms` (`10.10.1.0/24`) |
+| `2-variables.tf` | `location`, `admin_username`, `ssh_public_key` (sensitive), `my_ip` |
+| `3-main.tf` | Resource group, VNet, public IPs, NICs and the two VMs |
+| `4-outputs.tf` | `vm_private_ips` and `vm_public_ips`, keyed by VM name |
+| `5-sg.tf` | `sec-group-vms` NSG (SSH from `my_ip/32` only), attached to each NIC |
+| `6-local.tf` | `vm_names` set that drives every `for_each` |
+| `7-backend.tf` | `azurerm` remote state backend |
+
+## Resources Created
+
+| Resource | Name | Count |
+| --- | --- | --- |
+| Resource group | `rg-terraform-vms` (UK South) | 1 |
+| Virtual network | `vnet-main` (`10.10.0.0/16`) | 1 |
+| Subnet | `subnet-vms` (`10.10.1.0/24`) | 1 |
+| Network security group | `sec-group-vms` | 1 |
+| Public IP (Static, Standard) | `vm01-pip`, `vm02-pip` | 2 |
+| Network interface | `vm01-nic`, `vm02-nic` | 2 |
+| NSG-to-NIC association | one per NIC | 2 |
+| Linux VM (`Standard_D2ns_v6`, Ubuntu 24.04 LTS) | `vm01`, `vm02` | 2 |
+| **Total** | | **12** |
+
+To add another VM, add a name to `vm_names` in `6-local.tf`. Its public IP, NIC, NSG association and VM are created automatically.
+
+## How It Works
+
+1. **Log in to Azure** - the Azure CLI authenticates Terraform against my subscription.
+2. **Set up remote state** - Terraform's record of what it built lives in a private, versioned Azure Storage container, kept in a separate resource group so it's never deleted by accident.
+3. **Build the network** - a resource group in UK South, a virtual network and subnet, and a firewall rule that allows SSH (port 22) from my IP only.
+4. **Build the servers** - two Ubuntu 24.04 VMs (`vm01`, `vm02`), each with its own public IP, a 30 GB SSD, and password login disabled.
+5. **Deploy** - `terraform init`, `terraform plan`, `terraform apply` create all 12 resources.
+6. **Verify** - Terraform prints each server's IP address, ready to connect over SSH.
+7. **Tear down** - `terraform destroy` removes everything so nothing keeps billing.
+
+## Walkthrough
+
+### Azure login
 
 ![Azure account login](Images/Az-account-login.jpg "az account show output")
 
-# Step-2 (Provider Configuration)
-
-`0-providers.tf` pins the Terraform version and the `azurerm` provider, then configures the provider block:
-
-```hcl
-terraform {
-  required_version = ">= 1.8.0"
-
-  required_providers {
-    azurerm = {
-      source  = "hashicorp/azurerm"
-      version = "~> 5.0"
-    }
-  }
-}
-
-provider "azurerm" {
-  features {}
-}
-```
-
-# Step-3 (Networking Resources)
-
-Before the VMs can exist, they need a place to live. This step builds that neighborhood:
-
-* A resource group (a folder that holds everything for this project) in the UK South region
-* A private network for the VMs to sit inside, plus a subnet carved out of it
-* A firewall rule that only opens the door for SSH, so you can log in remotely
-* A public IP address and network card for each VM, so they're reachable from the internet
-
-# Step-4 (Compute Resources)
-
-This is where the actual virtual machines get created - two of them, `vm01` and `vm02`, built from the same template so they're identical twins:
-
-* A modest, low-cost VM size that's plenty for testing
-* Ubuntu 24.04 LTS as the operating system
-* Login is SSH-key-only - no passwords, so only someone with your private key can get in
-* A 30 GB disk for the operating system
-
-# Step-5 (Terraform Init)
-
-Input the following command in the terminal panel (PowerShell/Bash).
-* `terraform init`
-
-See screenshot below
+### Terraform init
 
 ![terraform init](Images/terraform-init.jpg "terraform init output")
 
-# Step-6 (Terraform Plan)
-
-Input the following command in the terminal panel.
-* `terraform plan -out=tfplan`
-
-See screenshot below
+### Terraform plan - 12 resources to add
 
 ![terraform plan](Images/terraform-plan.jpg "terraform plan output - 12 to add")
 
-# Step-7 (Terraform Apply)
-
-Input the following command in the terminal panel.
-* `terraform apply "tfplan"`
-
-See screenshot below
+### Terraform apply - 12 resources created
 
 ![terraform apply](Images/terraform-apply.jpg "terraform apply output - 12 added")
 
-# Step-8 (Verification)
+### Verification
 
-Confirm the VMs actually came up in Azure, and check the Terraform outputs for the assigned IPs.
+Both VMs running in Azure:
 
-* `az vm list -g rg-terraform-vms -d -o table`
-* `terraform output`
+![az vm list](Images/azure-vm-verify.png "az vm list - vm01 and vm02 running in uksouth")
 
-See screenshots below
+Terraform outputs showing each VM's private and public IP:
 
 ![terraform outputs](Images/terraform-outputs.jpg "terraform output - private and public IPs")
 
-VM confirmation
+Azure Portal confirmation:
+
 ![VM confirmation](Images/VM-Confirmation.jpg "Azure Portal - vm01 and vm02 both Running in rg-terraform-vms")
 
-Azure VM01 connect
+Connecting to each VM over SSH:
+
 ![Azure VM01 connect](Images/Azure-VM01.jpg "Azure Portal - vm01 Connect blade with SSH command")
 
-Azure VM02 connect
 ![Azure VM02 connect](Images/Azure-VM02.jpg "Azure Portal - vm02 Connect blade, SSH session into Ubuntu 24.04 LTS")
 
-# Errors
+## Challenges & Fixes
 
-A few bumps along the way, kept here for the next person who hits the same wall.
+Real problems I hit along the way and how I solved them.
 
-**Invalid resource type name** - a typo left the resource type blank in `3-main.tf`.
+### 1. Region out of capacity
 
-![name error](Images/name-error.jpg "Error: Invalid resource type name")
+The original VM size (`Standard_B2s`) wasn't available in UK South.
 
-**Unsupported attribute** - `local.vm_names` is a `toset()` of plain strings, so `each.value` is a string, not an object; `each.value.id` doesn't exist. Fixed by using `each.key` / `each.value` directly as the string.
-
-![value type error](Images/value-type-error.jpg "Error: Unsupported attribute - each.value.id")
-
-**Provider not registered** - the subscription hadn't registered the `Microsoft.Network` resource provider yet.
-
-![failed provider register](Images/failed-provider-register.jpg "Error: MissingSubscriptionRegistration for Microsoft.Network")
-
-Resolved by registering it (and the other providers this project needs) and polling until `"Registered"`:
-
-* `az provider register --namespace Microsoft.Network`
-
-![registering provider](Images/Registering-provider.jpg "registrationState: Registering -> Registered")
-
-![registering provider v2](Images/Registering-Provider-v2.jpg "Microsoft.Network, Microsoft.Compute and Microsoft.Storage all Registered")
-
-**SKU not available in region** - the original VM size `Standard_B2s` had no capacity in `uksouth`.
+**Fix:** switched to `Standard_D2ns_v6`, which was available in the region.
 
 ![capacity issue uksouth](Images/capacityIssue-uksouth.jpg "Error: SkuNotAvailable for Standard_B2s in uksouth")
 
-Resolved by switching the VM `size` to `Standard_D2ns_v6`, which had capacity in the region.
+### 2. Azure subscription not ready
 
-# Deliverables
-* Congrats, you have successfully deployed two Azure Linux VMs with Terraform and you are now ready for more pain.
-Collect screenshots for your records.
+The subscription hadn't enabled Azure's networking service, so Terraform couldn't create the network.
 
-* Resource group `rg-terraform-vms` containing a VNet, subnet, NSG, and two VMs (`vm01`, `vm02`) each with a static public IP.
-* `terraform output` showing the private and public IPs of both VMs.
+**Fix:** registered the required services (`Microsoft.Network`, `Microsoft.Compute`, `Microsoft.Storage`) with the Azure CLI.
 
-# Final Step - Teardown
-Unless you can print your own money, you will need to tear down your deployment.
-   * Input `terraform destroy -auto-approve` in your terminal.
-   * You will be asked to confirm deletion (unless `-auto-approve` is used) - say yes.
-   * Double check the Azure Portal/CLI that the resource group and its resources are gone.
-   * Triple check everything - Satya Nadella has enough money too.
+![failed provider register](Images/failed-provider-register.jpg "Error: MissingSubscriptionRegistration for Microsoft.Network")
 
-See screenshot below
+![registering provider v2](Images/Registering-Provider-v2.jpg "Microsoft.Network, Microsoft.Compute and Microsoft.Storage all Registered")
+
+### 3. Firewall was too open
+
+The first version allowed SSH from anywhere on the internet.
+
+**Fix:** locked the rule down to my own IP address, which is passed in as a variable.
+
+### 4. Code errors
+
+A typo left a resource type blank, and a loop referenced a property that didn't exist.
+
+**Fix:** corrected the resource name and fixed the loop to use the VM name directly.
+
+![name error](Images/name-error.jpg "Error: Invalid resource type name")
+
+![value type error](Images/value-type-error.jpg "Error: Unsupported attribute - each.value.id")
+
+## Teardown
+
+To avoid ongoing charges, everything is removed with one command:
+
+* `terraform destroy`
 
 ![terraform destroy](Images/terraform-destroy.jpg "terraform destroy - 12 destroyed")
 
-# Author
+## Run It Yourself
+
+You'll need Terraform 1.8+, the Azure CLI, an Azure subscription, and an SSH key pair.
+
+1. `az login`
+2. Create a resource group, storage account and container for remote state, then put their names in `7-backend.tf`:
+
+   ```bash
+   az group create -n rg-tfstate -l uksouth
+   az storage account create -n <unique-name> -g rg-tfstate -l uksouth --sku Standard_LRS
+   az storage container create -n tfstate --account-name <unique-name>
+   ```
+
+3. Create a `terraform.tfvars` file (it's git-ignored) with your IP and public SSH key:
+
+   ```hcl
+   my_ip          = "203.0.113.10"
+   ssh_public_key = "ssh-ed25519 AAAA... you@machine"
+   ```
+
+4. `terraform init`
+5. `terraform plan -out=tfplan`
+6. `terraform apply "tfplan"`
+7. `ssh azureadmin@<public-ip-from-output>`
+8. `terraform destroy` when finished
+
+## Author
+
 Benjamin Cooper
